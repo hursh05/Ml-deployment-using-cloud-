@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda Container
+
+Parameters:
+  EntrypointImage:
+    Type: String
+    Description: Enter de ImageUri of lambda application.
+  
+  FeatureGenerationImage:
+    Type: String
+    Description: Enter de ImageUri of lambda application.
+  
+  BatchEventImage:
+    Type: String
+    Description: Enter de ImageUri of lambda application.
+  
+  ProcessingImage:
+    Type: String
+    Description: Enter de ImageUri of lambda application.
+
+  PredictImage:
+    Type: String
+    Description: Enter de ImageUri of lambda application.
+  
+  S3BucketName:
+    Type: String
+    Default: crawler-ml-challenge
+    Description: Bucket name to put csv with query urls.
+
+  DynamoTableName:
+    Type: String
+    Default: crawler_appearences
+    Description: Table name of our database.
+
+  BucketModelName:
+    Type: String
+    Default: crawler-bucket-model
+    Description: Bucket name of our model registry
+
+Resources:
+
+  Entrypoint:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: crawler-entrypoint
+      Role: !GetAtt Role.Arn
+      PackageType: Image
+      Code:
+        ImageUri: !Ref EntrypointImage
+      Timeout: 10
+  
+  Predict:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: crawler-predict-appearances
+      Role: !GetAtt Role.Arn
+      PackageType: Image
+      Code:
+        ImageUri: !Ref PredictImage
+      Timeout: 180
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoTableName
+          MODEL_NAME: 'NOTHING'
+          BUCKET_NAME: !Ref BucketModelName
+
+  FeatureGeneration:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: crawler-feature-generation
+      Role: !GetAtt Role.Arn
+      PackageType: Image
+      Code:
+        ImageUri: !Ref FeatureGenerationImage
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoTableName
+
+  Processing:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: crawler-processing
+      Role: !GetAtt Role.Arn
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ProcessingImage
+      Timeout: 10
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref UrlsQueue
+          TABLE_NAME: !Ref DynamoTableName
+  
+  BatchEvent:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: crawler-batch-event
+      Role: !GetAtt Role.Arn
+      PackageType: Image
+      Code:
+        ImageUri: !Ref BatchEventImage
+      Timeout: 10
+      Environment:
+        Variables:
+          BUCKET: !Ref S3BucketName
+          QUEUE_URL: !Ref UrlsQueue
+          DEPTH: 3
+
+  UrlsQueue:
+    Type: AWS::SQS::Queue
+    Properties: 
+      QueueName: urls-queue
+
+  SQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties: 
+      EventSourceArn: !GetAtt UrlsQueue.Arn
+      FunctionName: !Ref Processing
+      BatchSize: 1
+  
+  BucketCsv:
+    Type: AWS::S3::Bucket
+    DependsOn: S3InvokePermission
+    Properties:
+      BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: inputs/
+            Function: !GetAtt BatchEvent.Arn
+  
+  BucketModel:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketModelName
+  
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: BatchEvent
+    Properties:
+      FunctionName:
+        Fn::GetAtt:
+          - BatchEvent
+          - Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:aws:s3:::${S3BucketName}
+  
+  Database:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions:
+        - 
+          AttributeName: link
+          AttributeType: S
+      KeySchema:
+        - 
+          AttributeName: link
+          KeyType: HASH
+      TableName: !Ref DynamoTableName
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5 
+
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: lambda-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "cloudwatch:*"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeVpcs"
+                  - "events:*"
+                  - "iam:GetPolicy"
+                  - "iam:GetPolicyVersion"
+                  - "iam:GetRole"
+                  - "iam:GetRolePolicy"
+                  - "iam:ListAttachedRolePolicies"
+                  - "iam:ListRolePolicies"
+                  - "iam:ListRoles"
+                  - "iam:PassRole"
+                  - "kms:ListAliases"
+                  - "lambda:*"
+                  - "logs:*"
+                  - "tag:GetResources"
+                  - "s3:*"
+                  - "sqs:*"
+                  - "dynamodb:*"
+                Resource: '*'
+      MaxSessionDuration: 3600
+  
+  API:
+    Type: AWS::ApiGateway::RestApi
+    Properties: 
+      Name: crawler-api
+      Description: API used for get link features and predict appearances
+      FailOnWarnings: true
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  
+  APILambdaPermissionEntrypoint:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !GetAtt Entrypoint.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${API}/*'
+  
+  APILambdaPermissionPredict:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !GetAtt Predict.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${API}/*'
+  
+  LinkFeaturesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref API
+      ParentId: !GetAtt API.RootResourceId
+      PathPart: link_features
+  
+  PredictResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref API
+      ParentId: !GetAtt API.RootResourceId
+      PathPart: predict
+  
+  LinkFeaturesRequestGET:
+    DependsOn: APILambdaPermissionEntrypoint
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Entrypoint.Arn}/invocations
+      RequestParameters:
+        method.request.querystring.link: True
+      ResourceId: !Ref LinkFeaturesResource
+      RestApiId: !Ref API
+  
+  PredictRequestPOST:
+    DependsOn: APILambdaPermissionPredict
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Predict.Arn}/invocations
+      ResourceId: !Ref PredictResource
+      RestApiId: !Ref API
+  
+  Deployment:
+    DependsOn: [PredictRequestPOST, LinkFeaturesRequestGET]
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref API
+      Description: Deployment
+      StageName: prod
